@@ -23,7 +23,19 @@ fetch, fast-forward or rebase one checkout from those surfaces.
 - Scanning leaves every repository byte-identical; only the three explicit
   actions write, and each checks preconditions against a fresh probe.
 
+## Tracking
+
+The service shows only checkouts the user adds, not everything under the root.
+The list is a plain file (`~/.config/codedash/repos`, overridable with
+`--repos-file`), one path per line relative to the root. `codedash add`
+resolves a name against the discovered tree and appends it; `codedash rm`
+removes it; `--all` bypasses the list for audits. The daemon re-reads the file
+every scan, and the add/rm commands trigger a rescan when the daemon is up.
+A missing file means nothing is tracked.
+
 ## Discovery
+
+Discovery only runs for `--all` and for resolving `codedash add` targets.
 
 The tree is not flat: 212 checkouts, 115 physical repositories, 97 linked
 worktrees, nested repositories up to depth 4.

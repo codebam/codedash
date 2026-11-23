@@ -35,6 +35,27 @@ Nothing is fetched during a scan, so `behind` is only as fresh as the last
 `git fetch`. That is what `refs_fetched_at` is for: the dashboard shows
 "fetched 3d ago" instead of pretending the count is news.
 
+## Tracking repositories
+
+codedash shows only the checkouts you add — a curated list, not everything
+that happens to sit under the root. The list lives at
+`~/.config/codedash/repos` (override with `--repos-file`), one path per line
+relative to `--root`:
+
+```console
+$ codedash add                       # list what can be added, marking tracked ones
+$ codedash add viewport matrix-workers
+$ codedash rm viewport
+$ codedash repos
+```
+
+`--all` on `list`, `watch`, `tui`, `serve` or `scan` ignores the list and
+discovers every checkout under the root — that is the audit path, and the only
+mode in which worktrees and nested repositories are found implicitly. The
+daemon re-reads the file on each scan and `add`/`rm` ask it to rescan, so a
+change lands immediately; neither command touches the repository itself.
+A missing list means an empty dashboard, with the hint on the page.
+
 ## Run it
 
 Standalone, no packaging needed:

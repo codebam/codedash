@@ -54,6 +54,12 @@ DEFAULT_PORT = 8090
 DEFAULT_URL = f"http://127.0.0.1:{DEFAULT_PORT}"
 DEFAULT_STATE_DIR = "/var/lib/codedash"
 
+# The tracked list. A curated file is the default: codedash shows what has
+# been added, not everything that happens to be sitting under the root.
+DEFAULT_REPOS_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "codedash", "repos"
+)
+
 # Where nginx mounts it. The handler also serves the unprefixed paths, so the
 # page's relative fetch() calls resolve the same on loopback and behind nginx.
 BASE_PATH = "/codedash"
@@ -375,62 +381,78 @@ def _under(path: str, root: str) -> bool:
     return os.path.realpath(path).startswith(os.path.realpath(root) + os.sep)
 
 
-def collect(root: str, workers: int = DEFAULT_WORKERS, timeout: int = DEFAULT_TIMEOUT) -> dict:
-    """Scan the whole tree once and return the JSON payload every surface uses."""
+def collect(
+    root: str,
+    workers: int = DEFAULT_WORKERS,
+    timeout: int = DEFAULT_TIMEOUT,
+    repos: list[str] | None = None,
+) -> dict:
+    """Scan once and return the JSON payload every surface uses.
+
+    `repos` is the tracked list. None means "discover everything under root",
+    which is the audit path; a list means those checkouts only. A manual list
+    must not silently grow worktrees or nested repositories the user never
+    added, so worktree expansion only happens in discovery mode.
+    """
     started = time.monotonic()
     root = os.path.abspath(os.path.expanduser(root))
     records: dict[str, dict] = {}
 
-    candidates = discover(root) if os.path.isdir(root) else []
+    if repos is None:
+        candidates = discover(root) if os.path.isdir(root) else []
+    else:
+        candidates = [path for path in repos if os.path.isdir(path)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for rec in pool.map(lambda p: probe(p, timeout), candidates):
             records[rec["path"]] = rec
 
-    # Group by physical repository so `git worktree list` can reveal checkouts
-    # the walk missed (for example a linked worktree outside the depth window).
-    groups: dict[str, list[dict]] = {}
-    for rec in records.values():
-        if rec["_commondir"]:
-            groups.setdefault(rec["_commondir"], []).append(rec)
-
     external = 0
-    missing: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        work = {}
+    if repos is None:
+        # Group by physical repository so `git worktree list` can reveal
+        # checkouts the walk missed (for example a linked worktree outside the
+        # depth window). Discovery only: a manual list is scanned as written.
+        groups: dict[str, list[dict]] = {}
+        for rec in records.values():
+            if rec["_commondir"]:
+                groups.setdefault(rec["_commondir"], []).append(rec)
+
+        missing: list[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            work = {}
+            for commondir, members in groups.items():
+                anchor = next(
+                    (m for m in members if m["_gitdir"] and os.path.realpath(m["_gitdir"]) == os.path.realpath(commondir)),
+                    members[0],
+                )
+                work[commondir] = pool.submit(worktree_paths, anchor["path"], timeout)
+            # Resolve once: regenerating this set per worktree path turned a 1 s
+            # scan into 4 s on a tree with this many worktrees.
+            known = {os.path.realpath(rec["path"]) for rec in records.values()}
+            for commondir, future in work.items():
+                for path in future.result():
+                    resolved = os.path.realpath(path)
+                    if resolved in known:
+                        continue
+                    if _under(path, root):
+                        known.add(resolved)
+                        missing.append(path)
+                    else:
+                        external += 1
+
+        if missing:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                for rec in pool.map(lambda p: probe(p, timeout), sorted(set(missing))):
+                    records[rec["path"]] = rec
+
+        # Authoritative main-repo path for the worktrees that were found.
         for commondir, members in groups.items():
             anchor = next(
                 (m for m in members if m["_gitdir"] and os.path.realpath(m["_gitdir"]) == os.path.realpath(commondir)),
-                members[0],
+                None,
             )
-            work[commondir] = pool.submit(worktree_paths, anchor["path"], timeout)
-        # Resolve once: regenerating this set per worktree path turned a 1 s
-        # scan into 4 s on a tree with this many worktrees.
-        known = {os.path.realpath(rec["path"]) for rec in records.values()}
-        for commondir, future in work.items():
-            for path in future.result():
-                resolved = os.path.realpath(path)
-                if resolved in known:
-                    continue
-                if _under(path, root):
-                    known.add(resolved)
-                    missing.append(path)
-                else:
-                    external += 1
-
-    if missing:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            for rec in pool.map(lambda p: probe(p, timeout), sorted(set(missing))):
-                records[rec["path"]] = rec
-
-    # Authoritative main-repo path, and whether a checkout sits inside another.
-    for commondir, members in groups.items():
-        anchor = next(
-            (m for m in members if m["_gitdir"] and os.path.realpath(m["_gitdir"]) == os.path.realpath(commondir)),
-            None,
-        )
-        if anchor:
-            for member in members:
-                member["main_repo"] = anchor["path"]
+            if anchor:
+                for member in members:
+                    member["main_repo"] = anchor["path"]
 
     final = []
     paths = [rec["path"] for rec in records.values()]
@@ -450,6 +472,41 @@ def collect(root: str, workers: int = DEFAULT_WORKERS, timeout: int = DEFAULT_TI
         "external_worktrees": external,
         "records": final,
     }
+
+
+def read_repos_file(path: str, root: str) -> list[str] | None:
+    """Tracked checkouts as absolute paths; None when the file does not exist."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return None
+    entries = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        entries.append(line if os.path.isabs(line) else os.path.normpath(os.path.join(root, line)))
+    return entries
+
+
+def write_repos_file(path: str, entries: list[str]) -> None:
+    """Replace the tracked list atomically. Entries are stored as written."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write("# codedash tracked checkouts, one per line, relative to --root\n")
+        for entry in entries:
+            handle.write(entry + "\n")
+    os.replace(tmp, path)
+
+
+def scan_scope(args) -> list[str] | None:
+    """What a command should scan: the tracked list, or the whole tree for --all."""
+    if getattr(args, "all", False):
+        return None
+    root = os.path.abspath(os.path.expanduser(args.root))
+    return read_repos_file(os.path.expanduser(args.repos_file), root) or []
 
 
 # --------------------------------------------------------------------------
@@ -655,7 +712,9 @@ def load(args, refresh: bool = False) -> tuple[dict, str]:
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             reason = getattr(exc, "reason", exc)
             print(f"codedash: {args.url} unreachable ({reason}); scanning locally", file=sys.stderr)
-    return collect(args.root, workers=getattr(args, "workers", DEFAULT_WORKERS)), "local scan"
+    return collect(
+        args.root, workers=getattr(args, "workers", DEFAULT_WORKERS), repos=scan_scope(args)
+    ), "local scan"
 
 
 # --------------------------------------------------------------------------
@@ -830,10 +889,14 @@ function render() {
       '<td class="path">' + ago(r.refs_fetched_at) + '</td>' +
       '</tr>';
   }).join('');
-  document.getElementById('rows').innerHTML = rows || '<tr><td colspan="7" class="dim" style="padding:18px 10px">nothing matches</td></tr>';
+  const empty = DATA.records.length === 0
+    ? 'no checkouts tracked yet — add one with <code>codedash add &lt;name&gt;</code>'
+    : 'nothing matches these filters';
+  document.getElementById('rows').innerHTML = rows ||
+    '<tr><td colspan="7" class="dim" style="padding:18px 10px">' + empty + '</td></tr>';
   document.getElementById('foot').textContent =
     'ahead/behind is measured against remote-tracking refs; nothing here fetches, so check the “fetched” column. ' +
-    'read-only: the scanner never writes to a repository.';
+    'only checkouts you track are shown (`codedash add`); the scanner itself never writes to a repository.';
 }
 function changes(r) {
   const total = (r.staged || 0) + (r.unstaged || 0) + (r.untracked || 0);
@@ -949,11 +1012,21 @@ setInterval(() => load(false), 20000);
 class Store:
     """One scan at a time, served stale-while-refreshing."""
 
-    def __init__(self, root: str, ttl: int = CACHE_TTL, state_dir: str | None = None, workers: int = DEFAULT_WORKERS):
+    def __init__(
+        self,
+        root: str,
+        ttl: int = CACHE_TTL,
+        state_dir: str | None = None,
+        workers: int = DEFAULT_WORKERS,
+        repos_file: str = DEFAULT_REPOS_FILE,
+        all_repos: bool = False,
+    ):
         self.root = root
         self.ttl = ttl
         self.state_dir = state_dir
         self.workers = workers
+        self.repos_file = repos_file
+        self.all_repos = all_repos
         self._lock = threading.Lock()
         self._scan_lock = threading.Lock()
         # One write at a time; two rebases in one checkout would be carnage.
@@ -972,8 +1045,14 @@ class Store:
     def warm(self) -> None:
         self._scan()
 
+    def _scope(self) -> list[str] | None:
+        if self.all_repos:
+            return None
+        # Re-read every scan so `codedash add` takes effect without a restart.
+        return read_repos_file(self.repos_file, self.root) or []
+
     def _scan(self) -> None:
-        payload = collect(self.root, workers=self.workers)
+        payload = collect(self.root, workers=self.workers, repos=self._scope())
         with self._lock:
             self._data = payload
             self._at = time.monotonic()
@@ -1193,7 +1272,10 @@ def cmd_list(args) -> int:
         if sys.stdout.isatty():
             print_summary(records, source, payload.get("duration_ms", 0))
         if not records:
-            print("nothing matches", file=sys.stderr)
+            if not payload["records"]:
+                print("no checkouts tracked; add one with `codedash add <name>`", file=sys.stderr)
+            else:
+                print("nothing matches", file=sys.stderr)
     if args.exit_code and any(rec["state"] in ("error", "conflicted", "operation") for rec in records):
         return 1
     return 0
@@ -1294,6 +1376,111 @@ def cmd_action(args) -> int:
     return 0
 
 
+def notify_daemon(args) -> None:
+    """A list edit should show up on the dashboard immediately, not in 30 s."""
+    if getattr(args, "local", False):
+        return
+    try:
+        fetch_service(args.url, refresh=True, timeout=20)
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        pass
+
+
+def cmd_add(args) -> int:
+    root = os.path.abspath(os.path.expanduser(args.root))
+    repos_file = os.path.expanduser(args.repos_file)
+    tracked = read_repos_file(repos_file, root) or []
+    known = {os.path.realpath(path) for path in tracked}
+
+    payload = collect(root, workers=DEFAULT_WORKERS)
+    if not args.targets:
+        # No target: show what can be added, which is the discovery audit.
+        rows = sorted(payload["records"], key=lambda rec: rec["path"])
+        for rec in rows:
+            mark = "  [tracked]" if os.path.realpath(rec["path"]) in known else ""
+            print(f"{rec['name']:<34} {rec['path']}{mark}")
+        if not rows:
+            print(f"codedash: no checkouts found under {root}", file=sys.stderr)
+        return 0
+
+    entries = [os.path.relpath(path, root) for path in tracked]
+    failed = False
+    changed = False
+    for target in args.targets:
+        rec, matches = resolve_target(payload["records"], target)
+        if rec is None:
+            failed = True
+            if not matches:
+                print(f"codedash: no checkout named {target!r} under {root}", file=sys.stderr)
+            else:
+                print(f"codedash: {target!r} is ambiguous ({len(matches)} matches):", file=sys.stderr)
+                for item in matches[:10]:
+                    print(f"  {item['name']:<34} {item['path']}", file=sys.stderr)
+            continue
+        if os.path.realpath(rec["path"]) in known:
+            print(f"already tracked: {os.path.relpath(rec['path'], root)}")
+            continue
+        known.add(os.path.realpath(rec["path"]))
+        rel = os.path.relpath(rec["path"], root)
+        entries.append(rel)
+        changed = True
+        print(f"tracked: {rel}")
+    if changed:
+        write_repos_file(repos_file, entries)
+        notify_daemon(args)
+    return 1 if failed else 0
+
+
+def cmd_rm(args) -> int:
+    root = os.path.abspath(os.path.expanduser(args.root))
+    repos_file = os.path.expanduser(args.repos_file)
+    tracked = read_repos_file(repos_file, root) or []
+    entries = [os.path.relpath(path, root) for path in tracked]
+    if not args.targets:
+        for entry in entries:
+            print(entry)
+        return 0
+
+    failed = False
+    changed = False
+    for target in args.targets:
+        matches = [
+            entry
+            for entry in entries
+            if entry == target
+            or os.path.basename(entry) == target
+            or os.path.realpath(os.path.join(root, entry)) == os.path.realpath(os.path.expanduser(target))
+        ]
+        if len(matches) != 1:
+            failed = True
+            if not matches:
+                print(f"codedash: {target!r} is not tracked", file=sys.stderr)
+            else:
+                print(f"codedash: {target!r} is ambiguous:", file=sys.stderr)
+                for item in matches:
+                    print(f"  {item}", file=sys.stderr)
+            continue
+        entries.remove(matches[0])
+        changed = True
+        print(f"untracked: {matches[0]}")
+    if changed:
+        write_repos_file(repos_file, entries)
+        notify_daemon(args)
+    return 1 if failed else 0
+
+
+def cmd_repos(args) -> int:
+    root = os.path.abspath(os.path.expanduser(args.root))
+    tracked = read_repos_file(os.path.expanduser(args.repos_file), root) or []
+    if not tracked:
+        print("no checkouts tracked; add one with `codedash add <name>`", file=sys.stderr)
+        return 0
+    for path in tracked:
+        marker = "" if os.path.isdir(path) else "  [missing]"
+        print(f"{os.path.relpath(path, root)}{marker}")
+    return 0
+
+
 def cmd_watch(args) -> int:
     color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
     try:
@@ -1309,13 +1496,20 @@ def cmd_watch(args) -> int:
 
 
 def cmd_scan(args) -> int:
-    payload = collect(args.root, workers=args.workers)
+    payload = collect(args.root, workers=args.workers, repos=scan_scope(args))
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_serve(args) -> int:
-    store = Store(args.root, ttl=args.ttl, state_dir=args.state_dir, workers=args.workers)
+    store = Store(
+        args.root,
+        ttl=args.ttl,
+        state_dir=args.state_dir,
+        workers=args.workers,
+        repos_file=args.repos_file,
+        all_repos=args.all,
+    )
     print(f"codedash: scanning {args.root}", file=sys.stderr, flush=True)
     store.warm()
     try:
@@ -1325,8 +1519,8 @@ def cmd_serve(args) -> int:
         return 2
     threading.Thread(target=store.loop, args=(args.interval,), daemon=True).start()
     print(
-        f"codedash: {store.count()} checkouts on http://127.0.0.1:{args.port} "
-        f"(mounted at {BASE_PATH}, rescans every {args.interval}s, "
+        f"codedash: http://127.0.0.1:{args.port} "
+        f"(mounted at {BASE_PATH}, {store.count()} tracked, rescans every {args.interval}s, "
         f"actions {'enabled' if args.allow_actions else 'disabled'})",
         file=sys.stderr,
         flush=True,
@@ -1589,6 +1783,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--root", default=os.environ.get("CODEDASH_ROOT", DEFAULT_ROOT), help="directory holding the checkouts")
     common.add_argument("--url", default=os.environ.get("CODEDASH_URL", DEFAULT_URL), help="daemon base URL")
     common.add_argument("--local", action="store_true", help="never contact the daemon; always scan locally")
+    common.add_argument(
+        "--repos-file",
+        default=os.environ.get("CODEDASH_REPOS_FILE", DEFAULT_REPOS_FILE),
+        help="file listing the tracked checkouts, one per line (relative to --root)",
+    )
 
     parser = argparse.ArgumentParser(prog="codedash", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"codedash {VERSION}")
@@ -1605,6 +1804,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="enable fetch / fast-forward / rebase over HTTP (off by default: they write to repositories)",
     )
+    serve.add_argument(
+        "--all",
+        action="store_true",
+        help="ignore the tracked list and discover every checkout under --root",
+    )
     serve.set_defaults(func=cmd_serve)
 
     listing = sub.add_parser("list", parents=[common], help="print the status table")
@@ -1613,6 +1817,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--sort", choices=["state", "recent", "path", "ahead", "behind", "dirty"], default="state")
     listing.add_argument("--json", action="store_true")
     listing.add_argument("--exit-code", action="store_true", help="nonzero when anything needs attention")
+    listing.add_argument("--all", action="store_true", help="ignore the tracked list")
     listing.set_defaults(func=cmd_list)
 
     watch = sub.add_parser("watch", parents=[common], help="redraw the table on an interval")
@@ -1620,10 +1825,12 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--state", type=lambda s: [x.strip() for x in s.split(",") if x.strip()])
     watch.add_argument("--grep", default="")
     watch.add_argument("--sort", choices=["state", "recent", "path", "ahead", "behind", "dirty"], default="state")
+    watch.add_argument("--all", action="store_true", help="ignore the tracked list")
     watch.set_defaults(func=cmd_watch)
 
     scan = sub.add_parser("scan", parents=[common], help="scan once and print JSON")
     scan.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    scan.add_argument("--all", action="store_true", help="ignore the tracked list")
     scan.set_defaults(func=cmd_scan)
 
     detail = sub.add_parser("detail", parents=[common], help="upstream distance and available actions for one checkout")
@@ -1643,7 +1850,19 @@ def build_parser() -> argparse.ArgumentParser:
         parser_action.set_defaults(func=cmd_action, action=action)
 
     tui = sub.add_parser("tui", parents=[common], help="interactive terminal view")
+    tui.add_argument("--all", action="store_true", help="ignore the tracked list")
     tui.set_defaults(func=cmd_tui)
+
+    add = sub.add_parser("add", parents=[common], help="track one checkout; with no argument, list candidates")
+    add.add_argument("targets", nargs="*", help="checkout name or path fragment")
+    add.set_defaults(func=cmd_add)
+
+    rm = sub.add_parser("rm", parents=[common], help="stop tracking one checkout (the repository itself is untouched)")
+    rm.add_argument("targets", nargs="*")
+    rm.set_defaults(func=cmd_rm)
+
+    repos = sub.add_parser("repos", parents=[common], help="print the tracked checkouts")
+    repos.set_defaults(func=cmd_repos)
     return parser
 
 

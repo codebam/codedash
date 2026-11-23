@@ -12,6 +12,11 @@ let
   cli = pkgs.writeShellScriptBin "codedash" ''
     exec ${python}/bin/python3 ${./codedash.py} "$@"
   '';
+
+  # The curated list of checkouts to track. The daemon re-reads it on every
+  # scan, so `codedash add` takes effect without a restart; it lives in the
+  # user's config because only they write it.
+  reposFile = "${config.users.users.${cfg.user}.home}/.config/codedash/repos";
 in
 {
   options.services.codedash = {
@@ -80,6 +85,7 @@ in
           + " --root ${cfg.root}"
           + " --port ${toString cfg.port}"
           + " --state-dir /var/lib/codedash"
+          + " --repos-file ${reposFile}"
           + " --interval ${toString cfg.scanInterval}"
           + lib.optionalString cfg.allowActions " --allow-actions";
         Restart = "on-failure";

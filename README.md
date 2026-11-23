@@ -13,6 +13,10 @@ One scanner feeds three surfaces, so they cannot disagree:
 | CLI | `codedash list` | table, `--json`, filters, `--exit-code` for scripts |
 | TUI | `codedash tui` | curses, keyboard navigation, actions from the detail panel |
 
+The dashboard orders by last commit, newest first; the sort menu switches
+to state, name or behind, and `codedash list --sort recent` gives the same
+order in the terminal.
+
 The scan itself never writes: `status` runs with `--no-optional-locks` and
 every git call gets `GIT_OPTIONAL_LOCKS=0`, so scanning 200 checkouts does not
 rewrite 200 index files.

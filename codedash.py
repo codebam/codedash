@@ -588,9 +588,22 @@ def filter_records(records: list[dict], states: list[str] | None, needle: str) -
     return out
 
 
+def commit_ts(rec: dict) -> float:
+    iso = (rec.get("last_commit") or {}).get("iso_time")
+    if not iso:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def sort_records(records: list[dict], key: str) -> list[dict]:
     if key == "path":
         return sorted(records, key=lambda r: r["path"])
+    if key == "recent":
+        # Newest commit first; checkouts with no commit at all sink to the end.
+        return sorted(records, key=lambda r: (-commit_ts(r), r["name"]))
     if key == "ahead":
         return sorted(records, key=lambda r: (-r["ahead"], r["path"]))
     if key == "behind":
@@ -668,6 +681,9 @@ h1{font-size:15px;margin:0;letter-spacing:.08em;text-transform:uppercase;color:#
 .controls{display:flex;flex-wrap:wrap;gap:8px;padding:0 22px 10px;align-items:center}
 input{background:#010409;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:5px 10px;font:inherit;min-width:280px}
 input:focus{outline:1px solid #1f6feb;border-color:#1f6feb}
+select{background:#010409;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:4px 8px;font:inherit;font-size:12px}
+select:focus{outline:1px solid #1f6feb;border-color:#1f6feb}
+.sort{color:#6e7681;font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;display:inline-flex;align-items:center;gap:6px}
 button{background:#161b22;border:1px solid #30363d;border-radius:6px;color:#8b949e;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer}
 button:hover{border-color:#8b949e;color:#c9d1d9}
 button.on{background:#1f6feb22;border-color:#1f6feb;color:#58a6ff}
@@ -717,6 +733,14 @@ tbody tr{cursor:pointer}
 <div class="controls">
   <input id="q" placeholder="filter by name, branch or path" autocomplete="off" spellcheck="false">
   <span id="filters"></span>
+  <label class="sort">sort
+    <select id="sort">
+      <option value="recent" selected>last commit</option>
+      <option value="state">state</option>
+      <option value="name">name</option>
+      <option value="behind">behind</option>
+    </select>
+  </label>
   <button id="refresh" title="ask the scanner to rescan now">rescan</button>
 </div>
 <table><thead><tr>
@@ -727,7 +751,9 @@ tbody tr{cursor:pointer}
 <div class="modal" id="modal"><div class="sheet" id="sheet"></div></div>
 <div class="toast" id="toast"></div>
 <script>
-let DATA = {records: []}, state = 'all', q = '';
+let DATA = {records: []}, state = 'all', q = '', sortBy = 'recent';
+const RANK = {error: 0, conflicted: 1, operation: 2, dirty: 3, ahead: 4, behind: 5, 'no-upstream': 6, clean: 7};
+const commitTime = r => Date.parse((r.last_commit || {}).iso_time) || 0;
 const FILTERS = ['all','dirty','ahead','behind','conflicted','operation','no-upstream','error'];
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const ago = iso => {
@@ -757,8 +783,14 @@ function summarise(rs) {
 }
 function visible() {
   const needle = q.toLowerCase();
-  return DATA.records.filter(r => (state === 'all' || r.state === state) &&
+  const out = DATA.records.filter(r => (state === 'all' || r.state === state) &&
     (!needle || (r.name + ' ' + (r.branch || '') + ' ' + r.path).toLowerCase().includes(needle)));
+  const byName = (a, b) => a.name.localeCompare(b.name) || a.path.localeCompare(b.path);
+  if (sortBy === 'recent') out.sort((a, b) => commitTime(b) - commitTime(a) || byName(a, b));
+  else if (sortBy === 'state') out.sort((a, b) => (RANK[a.state] ?? 9) - (RANK[b.state] ?? 9) || byName(a, b));
+  else if (sortBy === 'behind') out.sort((a, b) => b.behind - a.behind || byName(a, b));
+  else out.sort(byName);
+  return out;
 }
 function chip(label, value, cls) {
   return '<span class="chip ' + (cls || '') + '"><b>' + value + '</b> ' + label + '</span>';
@@ -901,6 +933,7 @@ async function load(refresh) {
   render();
 }
 document.getElementById('q').addEventListener('input', e => { q = e.target.value; render(); });
+document.getElementById('sort').addEventListener('change', e => { sortBy = e.target.value; render(); });
 document.getElementById('filters').addEventListener('click', e => {
   const f = e.target.getAttribute('data-f');
   if (f) { state = f; render(); }
@@ -1577,7 +1610,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing = sub.add_parser("list", parents=[common], help="print the status table")
     listing.add_argument("--state", type=lambda s: [x.strip() for x in s.split(",") if x.strip()])
     listing.add_argument("--grep", default="", help="substring over name, path, branch, upstream")
-    listing.add_argument("--sort", choices=["state", "path", "ahead", "behind", "dirty"], default="state")
+    listing.add_argument("--sort", choices=["state", "recent", "path", "ahead", "behind", "dirty"], default="state")
     listing.add_argument("--json", action="store_true")
     listing.add_argument("--exit-code", action="store_true", help="nonzero when anything needs attention")
     listing.set_defaults(func=cmd_list)
@@ -1586,7 +1619,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("interval", nargs="?", type=int, default=5)
     watch.add_argument("--state", type=lambda s: [x.strip() for x in s.split(",") if x.strip()])
     watch.add_argument("--grep", default="")
-    watch.add_argument("--sort", choices=["state", "path", "ahead", "behind", "dirty"], default="state")
+    watch.add_argument("--sort", choices=["state", "recent", "path", "ahead", "behind", "dirty"], default="state")
     watch.set_defaults(func=cmd_watch)
 
     scan = sub.add_parser("scan", parents=[common], help="scan once and print JSON")

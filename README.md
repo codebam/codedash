@@ -56,6 +56,10 @@ daemon re-reads the file on each scan and `add`/`rm` ask it to rescan, so a
 change lands immediately; neither command touches the repository itself.
 A missing list means an empty dashboard, with the hint on the page.
 
+The list is runtime state, not NixOS config: on a host with an
+impermanent root, keep it on persistent storage (`nixos-desktop`
+preserves `~/.config/codedash` for exactly this reason).
+
 ## Run it
 
 Standalone, no packaging needed:

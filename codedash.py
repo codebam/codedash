@@ -341,7 +341,14 @@ def probe(path: str, timeout: int = DEFAULT_TIMEOUT) -> dict:
             rec["stashes"] = sum(1 for line in sl.stdout.splitlines() if line.strip())
 
         rec["operation"] = detect_operation(gitdir)
-        rec["refs_fetched_at"] = iso_mtime(os.path.join(gitdir, "FETCH_HEAD"))
+        # FETCH_HEAD is per-worktree, but the remote refs it refreshes are
+        # shared through the common dir. A fetch in the main checkout is what
+        # usually keeps a linked worktree's "behind" count honest, so take the
+        # newer of the two stamps instead of reporting the worktree's as stale.
+        stamps = [iso_mtime(os.path.join(gitdir, "FETCH_HEAD"))]
+        if commondir and os.path.realpath(commondir) != os.path.realpath(gitdir):
+            stamps.append(iso_mtime(os.path.join(commondir, "FETCH_HEAD")))
+        rec["refs_fetched_at"] = max((stamp for stamp in stamps if stamp), default=None)
         rec["state"] = compute_state(rec)
     except subprocess.TimeoutExpired:
         rec["error"] = f"git timed out after {timeout}s"
@@ -482,8 +489,9 @@ def preconditions(rec: dict, action: str) -> tuple[bool, str]:
             return False, f"{rec['ahead']} local commit(s) are not upstream"
         if not rec["behind"]:
             return False, "already up to date"
-        if not rec["refs_fetched_at"]:
-            return False, "never fetched; run fetch first"
+        # A fresh clone has no FETCH_HEAD yet but a perfectly good upstream
+        # ref, and --ff-only cannot lose a commit, so refs age is not a
+        # precondition here -- it is only what the UI shows.
         return True, ""
     if action == "rebase":
         if not rec["ahead"] and not rec["behind"]:
